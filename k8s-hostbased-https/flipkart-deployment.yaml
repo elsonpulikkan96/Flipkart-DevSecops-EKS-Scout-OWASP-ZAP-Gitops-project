@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flipkart-ns
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flipkart-app-deployment
+  namespace: flipkart-ns
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: flipkart-app
+  template:
+    metadata:
+      labels:
+        app: flipkart-app
+    spec:
+      containers:
+        - name: flipkart-app-container
+          image: elsonpulikkan/flipkart:latest
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flipkart-app-service
+  namespace: flipkart-ns
+spec:
+  selector:
+    app: flipkart-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: ClusterIP
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myingress
+  namespace: flipkart-ns
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/load-balancer-name: flipkart-ns-alb
+    # Target Type and Listener Port
+
+
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}, {"HTTP":80}]'
+
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:ap-south-1:739275449845:certificate/99024852-00cc-4526-b198-cea5bf6e5516  # Replace with your ACM certificate ARN
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+spec:
+  ingressClassName: alb
+  rules:
+    - host: flip.elsondevops.cloud
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: flipkart-app-service
+                port:
+                  number: 80
+
+    - host: ""
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: flipkart-app-service
+                port:
+                  number: 80
