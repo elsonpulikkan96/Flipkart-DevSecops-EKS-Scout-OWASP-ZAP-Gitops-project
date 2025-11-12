@@ -2,14 +2,7 @@
 
 
 ## For more projects, check out  
-[https://harishnshetty.github.io/projects.html](https://harishnshetty.github.io/projects.html)
-
-[![Video Tutorial](https://github.com/harishnshetty/image-data-project/blob/d13e0ad9f2fc91499853cc8624b3c2d50f8f2e88/flipkart1.jpg)](https://youtu.be/KwKtMHBQXk4)
-
-
-## Flipkart Clone Sample Image
-
-[![Video Tutorial](https://github.com/harishnshetty/image-data-project/blob/d13e0ad9f2fc91499853cc8624b3c2d50f8f2e88/flipkart2.jpg)](https://youtu.be/KwKtMHBQXk4)
+[https://github.com/elsonpulikkan96](https://github.com/elsonpulikkan96)
 
 ## Jenkins Setup
 - Instance Type :- c5.xlarge  [4 Cpu 8Gb Ram ] 
@@ -380,17 +373,17 @@ aws configure list
 
 ```bash
 eksctl create cluster \
-  --name my-cluster \
-  --region ap-south-1 \
+  --name flip-store-elsondevops \
+  --region us-east-1 \
   --version 1.34 \
   --without-nodegroup
 
 eksctl create nodegroup \
-  --cluster my-cluster \
-  --name my-nodes-ng \
+  --cluster flip-store-elsondevops \
+  --name flip-store-elsondevopsng \
   --nodes 3 \
   --nodes-min 3 \
-  --nodes-max 6 \
+  --nodes-max 4 \
   --node-type t3.medium
 ```
 
@@ -399,7 +392,7 @@ eksctl create nodegroup \
 ## 7. Update kubeconfig
 
 ```bash
-aws eks update-kubeconfig --name my-cluster --region ap-south-1
+aws eks update-kubeconfig --name flip-store-elsondevops --region us-east-1
 ```
 
 ---
@@ -407,7 +400,7 @@ aws eks update-kubeconfig --name my-cluster --region ap-south-1
 ## 8. Associate IAM OIDC Provider
 
 ```bash
-eksctl utils associate-iam-oidc-provider --cluster my-cluster --approve
+eksctl utils associate-iam-oidc-provider --cluster flip-store-elsondevops --approve
 ```
 
 ---
@@ -432,12 +425,12 @@ Replace `<ACCOUNT_ID>` with your AWS account ID.
 
 ```bash
 eksctl create iamserviceaccount \
-  --cluster=my-cluster \
+  --cluster=flip-store-elsondevops \
   --namespace=kube-system \
   --name=aws-load-balancer-controller \
-  --attach-policy-arn=arn:aws:iam::<ACCOUNT_ID>:policy/AWSLoadBalancerControllerIAMPolicy \
+  --attach-policy-arn=arn:aws:iam::739275449845:policy/AWSLoadBalancerControllerIAMPolicy \
   --override-existing-serviceaccounts \
-  --region ap-south-1 \
+  --region us-east-1 \
   --approve
 ```
 
@@ -450,10 +443,10 @@ helm repo add eks https://aws.github.io/eks-charts
 helm repo update eks
 
 helm install aws-load-balancer-controller eks/aws-load-balancer-controller -n kube-system \
-  --set clusterName=my-cluster \
+  --set clusterName=flip-store-elsondevops \
   --set serviceAccount.create=false \
   --set serviceAccount.name=aws-load-balancer-controller \
-  --set region=ap-south-1 \
+  --set region=us-east-1 \
   --version 1.13.3
 ```
 
@@ -568,16 +561,12 @@ Password: encrypted-password
 - Subdomain (Wild-card ACM)
 - Attach the ingress
 
-## OWASP ZAPROXY
-
-[![Video Tutorial](https://github.com/harishnshetty/image-data-project/blob/d13e0ad9f2fc91499853cc8624b3c2d50f8f2e88/flipkart3.jpg)](https://youtu.be/KwKtMHBQXk4)
-
 
 ##  Delete EKS Cluster (Cleanup) finally u done a project 
- - For more conents reach out https://harishnshetty.github.io/projects.html
+ - For more conents reach out https://github.com/elsonpulikkan96/
 
 ```bash
-eksctl delete cluster --name my-cluster --region ap-south-1
+eksctl delete cluster --name flip-store-elsondevops --region us-east-1
 ```
 
 - Delete the ECR Repo
