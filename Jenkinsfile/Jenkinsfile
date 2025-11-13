@@ -199,7 +199,7 @@ pipeline {
                 def buildUrl = "${env.BUILD_URL}"
 
                 slackSend(
-                    channel: '#devsecops',
+                    channel: '#elsondevops-cicd',
                     color: COLOR_MAP[buildStatus],
                     message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
                     👤 *Started by:* ${buildUser}
