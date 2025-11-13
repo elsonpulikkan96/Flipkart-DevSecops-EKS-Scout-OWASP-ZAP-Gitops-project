@@ -1,34 +1,40 @@
-# ---------- Build Stage ----------
-FROM node:18-bullseye AS build
+# ---------- Build stage ----------
+FROM node:18-bullseye AS builder
 
-# Set working directory
+# working dir
 WORKDIR /app
 
-# Make react-scripts behave for CI and avoid sourcemaps
-ENV CI=true
+# Keep build deterministic and avoid warnings-as-errors by NOT forcing CI=true.
+# Avoid sourcemaps to speed up build and keep image smaller.
+ENV NODE_ENV=production
 ENV GENERATE_SOURCEMAP=false
 
-# Copy dependency files first for better caching
+# Copy package files first to leverage layer caching
 COPY package*.json ./
 
-# Use npm ci for deterministic install (faster & safer in CI)
+# Use npm ci for reproducible installs in CI
 RUN npm ci --silent
 
-# Copy rest of the code
+# Copy application source
 COPY . .
 
-# Build optimized production build
+# Build optimized production assets
+# If you need CI semantics for other checks, you can unset CI only for build:
+# RUN export CI= && npm run build
 RUN npm run build
 
-# ---------- Production Stage ----------
-FROM nginx:stable-alpine
+# ---------- Production stage ----------
+FROM nginx:stable-alpine AS runtime
 
-# Remove default nginx content and copy build output to nginx html directory
+# Remove default nginx content and add our build
 RUN rm -rf /usr/share/nginx/html/*
-COPY --from=build /app/build /usr/share/nginx/html
+COPY --from=builder /app/build /usr/share/nginx/html
 
-# Expose port 80
+# Optional: provide a small healthcheck
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD wget -qO- http://localhost/ >/dev/null || exit 1
+
 EXPOSE 80
 
-# Start nginx
+# Run nginx in foreground
 CMD ["nginx", "-g", "daemon off;"]
