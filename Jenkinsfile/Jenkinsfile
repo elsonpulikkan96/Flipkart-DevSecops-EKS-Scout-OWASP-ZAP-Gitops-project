@@ -31,7 +31,7 @@ pipeline {
             steps { sh "npm ci --silent" }
         }
 
-        stage("Sonarqube Analysis ") {
+        stage("Sonarqube Analysis") {
             steps {
                 withSonarQubeEnv('sonar-server') {
                     sh """${SCANNER_HOME}/bin/sonar-scanner -Dsonar.projectName=flipkart -Dsonar.projectKey=flipkart"""
@@ -65,10 +65,11 @@ pipeline {
             steps {
                 script {
                     withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
-                        sh "docker login -u elsonpulikkan -p ${dockerpwd}"
+                        // safer docker login (password-stdin)
+                        sh "echo ${dockerpwd} | docker login -u elsonpulikkan --password-stdin || true"
                         sh "docker-scout quickview fs://. > quickview-report.txt || true"
                         sh "docker-scout cves fs://. > cves-report.txt || true"
-                        sh "echo '--- Docker Scout Summary ---'"
+                        sh "echo '--- Docker Scout Summary ---' || true"
                         sh "head -20 quickview-report.txt || true"
                         sh "docker logout || true"
                     }
@@ -91,7 +92,7 @@ pipeline {
             steps {
                 script {
                     withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
-                        sh "docker login -u elsonpulikkan -p ${dockerpwd}"
+                        sh "echo ${dockerpwd} | docker login -u elsonpulikkan --password-stdin || true"
                         sh "docker-scout cves ${env.LOCAL_IMAGE} > image-cves-report.txt || true"
                         sh "docker-scout recommendations ${env.LOCAL_IMAGE} > image-recommendations.txt || true"
                         sh "docker logout || true"
@@ -108,8 +109,9 @@ pipeline {
                         docker tag ${env.LOCAL_IMAGE} ${IMAGE_NAME}:${BUILD_NUMBER}
                         docker tag ${env.LOCAL_IMAGE} ${IMAGE_NAME}:latest
                     """
+                    def registryHost = IMAGE_NAME.split('/')[0]
                     def dockerImage = docker.image("${IMAGE_NAME}")
-                    docker.withRegistry("https://${IMAGE_NAME.split('/')[0]}", registryCredential) {
+                    docker.withRegistry("https://${registryHost}", registryCredential) {
                         dockerImage.push("${BUILD_NUMBER}")
                         dockerImage.push("latest")
                     }
@@ -121,7 +123,7 @@ pipeline {
             steps {
                 script {
                     withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
-                        sh "docker login -u elsonpulikkan -p ${dockerpwd}"
+                        sh "echo ${dockerpwd} | docker login -u elsonpulikkan --password-stdin || true"
                         sh "docker tag ${env.LOCAL_IMAGE} ${DOCKERHUB_REPO}:${BUILD_NUMBER}"
                         sh "docker push ${DOCKERHUB_REPO}:${BUILD_NUMBER}"
                         sh "docker tag ${env.LOCAL_IMAGE} ${DOCKERHUB_REPO}:latest"
@@ -137,12 +139,12 @@ pipeline {
                 script {
                     sh "docker rm -f flipkart || true"
 
-                    // Start container with -P so Docker assigns a free host port
+                    // Let Docker assign an available host port with -P
                     def containerId = sh(script: "docker run -d --name flipkart -P ${env.LOCAL_IMAGE}", returnStdout: true).trim()
                     echo "containerId=${containerId}"
 
-                    // Extract mapped host port (for container port 80)
-                    def hostPort = sh(script: "docker port ${containerId} 80 | awk -F: '{print \$2}' | sed 's/[^0-9]*//g' | head -n1", returnStdout: true).trim()
+                    // Extract mapped host port for container port 80 using cut/tr (no awk backslash issues)
+                    def hostPort = sh(script: "docker port ${containerId} 80 | cut -d: -f2 | tr -dc '0-9' | head -n1", returnStdout: true).trim()
 
                     if (!hostPort) {
                         error "Failed to determine mapped host port for container ${containerId}"
@@ -151,7 +153,7 @@ pipeline {
                     env.APP_HOST_PORT = hostPort
                     echo "Container flipkart mapped host port: ${env.APP_HOST_PORT}"
 
-                    // quick smoke test
+                    // quick smoke test (curl is present inside container image but we test via host)
                     sh "curl -sSf http://localhost:${env.APP_HOST_PORT}/ || (echo 'health check failed' && docker logs ${containerId} && exit 1)"
                 }
             }
@@ -163,7 +165,7 @@ pipeline {
                     echo "🔍 Running OWASP ZAP baseline scan against http://localhost:${env.APP_HOST_PORT} ..."
                     def targetUrl = "http://localhost:${env.APP_HOST_PORT}"
 
-                    // Use env.WORKSPACE for mount (no $(pwd) -> no $ escaping problems)
+                    // Use env.WORKSPACE for mount to avoid $(pwd) and $ interpolation problems
                     def zapCmd = "docker run --rm --user root --network host -v ${env.WORKSPACE}:/zap/wrk:rw -t zaproxy/zap-stable zap-baseline.py -t ${targetUrl} -r zap_report.html -J zap_report.json"
                     def exitCode = sh(script: zapCmd, returnStatus: true)
 
@@ -196,16 +198,7 @@ pipeline {
             script {
                 def buildStatus = currentBuild.currentResult
                 def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'GitHub User'
-                def buildUrl = "${env.BUILD_URL}"
 
- /*               slackSend(
-                    channel: '#elsondevops-cicd',
-                    color: COLOR_MAP[buildStatus],
-                    message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
-                    👤 *Started by:* ${buildUser}
-                    🔗 *Build URL:* <${buildUrl}|Click Here for Details>"""
-              )
-*/
                 emailext (
                     subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                     body: """
