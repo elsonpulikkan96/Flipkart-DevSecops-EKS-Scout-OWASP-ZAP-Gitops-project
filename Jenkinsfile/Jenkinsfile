@@ -12,10 +12,8 @@ pipeline {
     environment {
         SCANNER_HOME = tool 'sonar-scanner'
         registryCredential = 'ecr:us-east-1:awscreds'
-        IMAGE_NAME   = '739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg'
-        flipkartRegistry = "https://739275449845.dkr.ecr.us-east-1.amazonaws.com"
-        // Local image name base we will use during build
-        LOCAL_IMAGE_BASE = "flipkart"
+        ECR_IMAGE = '739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg'
+        DOCKERHUB_REPO = 'elsonpulikkan/flipkart'
     }
 
     stages {
@@ -30,16 +28,13 @@ pipeline {
         }
 
         stage('Install Dependencies') {
-            steps {
-                // deterministic CI install
-                sh 'npm ci'
-            }
+            steps { sh "npm ci --silent" }
         }
 
         stage("Sonarqube Analysis") {
             steps {
                 withSonarQubeEnv('sonar-server') {
-                    sh """${SCANNER_HOME}/bin/sonar-scanner -Dsonar.projectName=flipkart \
+                    sh """$SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=flipkart \
                         -Dsonar.projectKey=flipkart"""
                 }
             }
@@ -49,7 +44,6 @@ pipeline {
             steps {
                 script {
                     timeout(time: 3, unit: 'MINUTES') {
-                        // don't abort pipeline immediately; we will still report status
                         waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
                     }
                 }
@@ -73,9 +67,11 @@ pipeline {
                 script {
                     withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
                         sh "docker login -u elsonpulikkan -p ${dockerpwd}"
-                        sh "docker-scout quickview fs://. > quickview-report.txt || true"
-                        sh "docker-scout cves fs://. > cves-report.txt || true"
-                        sh "echo '--- Docker Scout Summary ---'; head -20 quickview-report.txt || true"
+                        sh "docker-scout quickview fs://. > quickview-report.txt"
+                        sh "docker-scout cves fs://. > cves-report.txt"
+                        sh "echo '--- Docker Scout Summary ---'"
+                        sh "head -20 quickview-report.txt || true"
+                        sh "docker logout"
                     }
                 }
                 archiveArtifacts artifacts: '*.txt, *.json', fingerprint: true
@@ -85,10 +81,10 @@ pipeline {
         stage("Build Docker Image") {
             steps {
                 script {
-                    // Build a uniquely-tagged local image (used for scans and pushing)
-                    env.LOCAL_IMAGE_TAG = "${LOCAL_IMAGE_BASE}:${BUILD_NUMBER}"
-                    sh "docker rmi -f ${LOCAL_IMAGE_TAG} || true"
-                    sh "docker build -t ${LOCAL_IMAGE_TAG} ."
+                    // Build and tag a local image with build number
+                    env.LOCAL_IMAGE = "flipkart:${BUILD_NUMBER}"
+                    sh "docker rmi -f ${env.LOCAL_IMAGE} || true"
+                    sh "docker build -t ${env.LOCAL_IMAGE} ."
                 }
             }
         }
@@ -98,28 +94,28 @@ pipeline {
                 script {
                     withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
                         sh "docker login -u elsonpulikkan -p ${dockerpwd}"
-                        sh "docker-scout cves ${LOCAL_IMAGE_TAG} > image-cves-report.txt || true"
-                        sh "docker-scout recommendations ${LOCAL_IMAGE_TAG} > image-recommendations.txt || true"
+                        sh "docker-scout cves ${env.LOCAL_IMAGE} > image-cves-report.txt || true"
+                        sh "docker-scout recommendations ${env.LOCAL_IMAGE} > image-recommendations.txt || true"
+                        sh "docker logout"
                     }
                 }
-                archiveArtifacts artifacts: 'image-*.txt, quickview-report.txt, cves-report.txt', fingerprint: true
+                archiveArtifacts artifacts: '*.txt, *.json', fingerprint: true
             }
         }
 
         stage("Upload App Image to ECR") {
             steps {
                 script {
-                    // Tag local image for ECR & push using docker plugin
-                    def ecrTag = "${IMAGE_NAME}:${BUILD_NUMBER}"
-                    sh "docker tag ${LOCAL_IMAGE_TAG} ${ecrTag}"
-                    sh "docker tag ${LOCAL_IMAGE_TAG} ${IMAGE_NAME}:latest"
-
-                    def dockerImage = docker.image("${IMAGE_NAME}")
-                    docker.withRegistry(flipkartRegistry, registryCredential) {
+                    // Tag local image for ECR and push
+                    sh """
+                        docker tag ${env.LOCAL_IMAGE} ${ECR_IMAGE}:${BUILD_NUMBER}
+                        docker tag ${env.LOCAL_IMAGE} ${ECR_IMAGE}:latest
+                    """
+                    def dockerImage = docker.image("${ECR_IMAGE}")
+                    docker.withRegistry("https://739275449845.dkr.ecr.us-east-1.amazonaws.com", registryCredential) {
                         dockerImage.push("${BUILD_NUMBER}")
                         dockerImage.push("latest")
                     }
-                    sh "docker logout || true"
                 }
             }
         }
@@ -129,55 +125,39 @@ pipeline {
                 script {
                     withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
                         sh "docker login -u elsonpulikkan -p ${dockerpwd}"
-                        // Tag the built local image with your DockerHub user tag and push
-                        env.IMAGE_TAG = "elsonpulikkan/flipkart:${BUILD_NUMBER}"
-                        sh "docker tag ${LOCAL_IMAGE_TAG} ${env.IMAGE_TAG}"
-                        sh "docker push ${env.IMAGE_TAG}"
-                        sh "docker tag ${LOCAL_IMAGE_TAG} elsonpulikkan/flipkart:latest"
-                        sh "docker push elsonpulikkan/flipkart:latest"
-                        sh "docker logout || true"
+                        sh "docker tag ${env.LOCAL_IMAGE} ${DOCKERHUB_REPO}:${BUILD_NUMBER}"
+                        sh "docker push ${DOCKERHUB_REPO}:${BUILD_NUMBER}"
+                        sh "docker tag ${env.LOCAL_IMAGE} ${DOCKERHUB_REPO}:latest"
+                        sh "docker push ${DOCKERHUB_REPO}:latest"
+                        sh "docker logout"
                     }
                 }
             }
         }
 
-        // Deploy stage - finds a free high port and runs the container bound to 127.0.0.1:<PORT>:80
-        stage("Deploy to Container") {
+        stage("Deploy to Container (ephemeral host port)") {
             steps {
                 script {
-                    // choose a free port in a safe ephemeral range (30000-30100)
-                    def hostPort = sh(script: '''
-                        for p in $(seq 30000 30100); do
-                          if ! ss -ltn "( sport = :$p )" >/dev/null 2>&1 && ! ss -ltn | grep -q ":$p "; then
-                            echo $p
-                            exit 0
-                          fi
-                        done
-                        echo ""
-                    ''', returnStdout: true).trim()
+                    // Remove any existing container and run with -P (publish exposed ports to random host ports)
+                    sh "docker rm -f flipkart || true"
+
+                    // Run container and get container id
+                    def containerId = sh(script: "docker run -d --name flipkart -P ${env.LOCAL_IMAGE}", returnStdout: true).trim()
+                    echo "containerId=${containerId}"
+
+                    // Get host port mapped to container port 80
+                    def hostPort = sh(script: "docker port ${containerId} 80 | sed -E 's/.*:(\\\d+)\$/\\1/' | head -n1", returnStdout: true).trim()
 
                     if (!hostPort) {
-                        error "No free port available in range 30000-30100"
+                        error "Failed to determine mapped host port for container ${containerId}"
                     }
-                    echo "Selected host port: ${hostPort}"
-                    env.HOST_PORT = hostPort
-                    env.APP_URL = "http://localhost:${hostPort}"
 
-                    // stop/remove previous container if exists and run container bound to 127.0.0.1
-                    sh "docker rm -f flipkart || true"
-                    sh "docker run -d --name flipkart -p 127.0.0.1:${HOST_PORT}:80 ${LOCAL_IMAGE_TAG}"
+                    // expose host port to later stages
+                    env.APP_HOST_PORT = hostPort
+                    echo "Container flipkart is mapped to host port: ${env.APP_HOST_PORT}"
 
-                    // wait for the app to respond (simple loop)
-                    sh '''
-                      for i in $(seq 1 20); do
-                        if curl -sI --max-time 2 "http://localhost:'"${HOST_PORT}"'" >/dev/null 2>&1; then
-                          echo "App is up on port '"${HOST_PORT}"'"
-                          exit 0
-                        fi
-                        sleep 1
-                      done
-                      echo "App did not respond within timeout"; exit 1
-                    '''
+                    // quick smoke test
+                    sh "curl -sSf http://localhost:${env.APP_HOST_PORT}/healthz || (echo 'health check failed' && docker logs ${containerId} && exit 1)"
                 }
             }
         }
@@ -185,28 +165,27 @@ pipeline {
         stage("DAST Scan with OWASP ZAP") {
             steps {
                 script {
-                    echo "🔍 Running OWASP ZAP baseline scan against ${env.APP_URL} ..."
-
-                    // We'll run ZAP with host networking so it can reach localhost:<HOST_PORT>
-                    def zapExit = sh(script: """
-                        docker run --rm --user root --network host -v \$(pwd):/zap/wrk:rw -t zaproxy/zap-stable zap-baseline.py \
-                          -t ${env.APP_URL} \
-                          -r zap_report.html -J zap_report.json
+                    echo "🔍 Running OWASP ZAP baseline scan against http://localhost:${env.APP_HOST_PORT} ..."
+                    def targetUrl = "http://localhost:${env.APP_HOST_PORT}"
+                    // Run ZAP baseline scan container (runs as ephemeral container). Don't abort pipeline on non-zero so we archive logs.
+                    def exitCode = sh(script: """
+                        docker run --rm --user root --network host -v $(pwd):/zap/wrk:rw -t zaproxy/zap-stable zap-baseline.py \
+                          -t ${targetUrl} -r zap_report.html -J zap_report.json
                     """, returnStatus: true)
-
-                    echo "ZAP scan finished with exit code: ${zapExit}"
+                    echo "ZAP scan finished with exit code: ${exitCode}"
 
                     if (fileExists('zap_report.json')) {
                         def zapJson = readJSON file: 'zap_report.json'
-                        def highCount = zapJson.site.collect { s -> s.alerts.findAll { it.risk == 'High' }.size() }.sum()
-                        def mediumCount = zapJson.site.collect { s -> s.alerts.findAll { it.risk == 'Medium' }.size() }.sum()
-                        def lowCount = zapJson.site.collect { s -> s.alerts.findAll { it.risk == 'Low' }.size() }.sum()
-
-                        echo "✅ High severity issues: ${highCount}"
-                        echo "⚠️ Medium severity issues: ${mediumCount}"
-                        echo "ℹ️ Low severity issues: ${lowCount}"
+                        // best-effort counts (guarded)
+                        def highCount = 0; def mediumCount = 0; def lowCount = 0
+                        if (zapJson?.site) {
+                            highCount = zapJson.site.collect { s -> s.alerts.findAll { it.risk == 'High' }.size() }.sum()
+                            mediumCount = zapJson.site.collect { s -> s.alerts.findAll { it.risk == 'Medium' }.size() }.sum()
+                            lowCount = zapJson.site.collect { s -> s.alerts.findAll { it.risk == 'Low' }.size() }.sum()
+                        }
+                        echo "ZAP: High=${highCount}, Medium=${mediumCount}, Low=${lowCount}"
                     } else {
-                        echo "ZAP JSON report not found; continuing"
+                        echo "ZAP JSON report not found, continuing..."
                     }
                 }
             }
@@ -216,8 +195,7 @@ pipeline {
                 }
             }
         }
-
-    } // end stages
+    }
 
     post {
         always {
@@ -226,7 +204,6 @@ pipeline {
                 def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'GitHub User'
                 def buildUrl = "${env.BUILD_URL}"
 
-                // Slack notification (make sure slack plugin & credentials configured)
                 slackSend(
                     channel: '#devsecops',
                     color: COLOR_MAP[buildStatus],
@@ -235,7 +212,6 @@ pipeline {
                     🔗 *Build URL:* <${buildUrl}|Click Here for Details>"""
                 )
 
-                // Email notification
                 emailext (
                     subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                     body: """
