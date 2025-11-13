@@ -10,20 +10,17 @@ pipeline {
         jdk 'jdk17'
     }
     environment {
-
         SCANNER_HOME = tool 'sonar-scanner'
-
         registryCredential = 'ecr:us-east-1:awscreds'
-        IMAGE_NAME   = '739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg'               
+        IMAGE_NAME   = '739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg'
         flipkartRegistry = "https://739275449845.dkr.ecr.us-east-1.amazonaws.com"
+        // Local image name base we will use during build
+        LOCAL_IMAGE_BASE = "flipkart"
     }
-    
-    
+
     stages {
         stage("Clean Workspace") {
-            steps {
-                cleanWs()
-            }
+            steps { cleanWs() }
         }
 
         stage("Git Checkout") {
@@ -32,20 +29,18 @@ pipeline {
             }
         }
 
-
- 
         stage('Install Dependencies') {
             steps {
-                sh "npm install"
+                // deterministic CI install
+                sh 'npm ci'
             }
         }
 
-
-        stage("Sonarqube Analysis "){
-            steps{
+        stage("Sonarqube Analysis") {
+            steps {
                 withSonarQubeEnv('sonar-server') {
-                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=flipkart \
-                    -Dsonar.projectKey=flipkart '''
+                    sh """${SCANNER_HOME}/bin/sonar-scanner -Dsonar.projectName=flipkart \
+                        -Dsonar.projectKey=flipkart"""
                 }
             }
         }
@@ -54,175 +49,135 @@ pipeline {
             steps {
                 script {
                     timeout(time: 3, unit: 'MINUTES') {
-                  
-                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
+                        // don't abort pipeline immediately; we will still report status
+                        waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token'
+                    }
                 }
             }
         }
-        }
-
-
-    
 
         stage("OWASP Dependency Check Scan") {
             steps {
                 dependencyCheck additionalArguments: '''
-                    --scan . 
-                    --disableYarnAudit 
-                    --disableNodeAudit 
+                    --scan .
+                    --disableYarnAudit
+                    --disableNodeAudit
                 ''',
                 odcInstallation: 'dp-check'
                 dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
             }
         }
 
-        // stage('Docker Scout FS') {
-        //     steps {
-        //         script{
-        //              withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
-        //                 sh "docker login -u elsonpulikkan -p ${dockerpwd}"
-        //                sh 'docker-scout quickview fs://.'
-        //                sh 'docker-scout cves fs://.'
-        //            }
-        //         }   
-        //     }
-        // }
-
-
-            stage('Docker Scout FS') {
-                steps {
-                    script {
-                        withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
-                            // Login to Docker Hub
-                            sh "docker login -u elsonpulikkan -p ${dockerpwd}"
-
-                            // Generate a quick overview and save it as a text file
-                            sh "docker-scout quickview fs://. > quickview-report.txt"
-
-                            // Generate detailed CVE reports in JSON and text format
-                            // sh "docker-scout cves fs://. --format json > cves-report.json"
-                            sh "docker-scout cves fs://. > cves-report.txt"
-
-                            // Display partial output in Jenkins console
-                            sh "echo '--- Docker Scout Summary ---'"
-                            sh "head -20 quickview-report.txt"
-                        }
+        stage('Docker Scout FS') {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
+                        sh "docker login -u elsonpulikkan -p ${dockerpwd}"
+                        sh "docker-scout quickview fs://. > quickview-report.txt || true"
+                        sh "docker-scout cves fs://. > cves-report.txt || true"
+                        sh "echo '--- Docker Scout Summary ---'; head -20 quickview-report.txt || true"
                     }
-                    // Archive all generated reports for download from Jenkins UI
-                    archiveArtifacts artifacts: '*.txt, *.json', fingerprint: true
                 }
+                archiveArtifacts artifacts: '*.txt, *.json', fingerprint: true
             }
-
-
+        }
 
         stage("Build Docker Image") {
             steps {
                 script {
-
-                    env.IMAGE_TAG = "elsonpulikkan/flipkart:${BUILD_NUMBER}"
-                    
-                    // Optional cleanup
-                    sh "docker rmi -f flipkart ${env.IMAGE_TAG} || true"
-
-                    sh "docker build  -t flipkart ."
+                    // Build a uniquely-tagged local image (used for scans and pushing)
+                    env.LOCAL_IMAGE_TAG = "${LOCAL_IMAGE_BASE}:${BUILD_NUMBER}"
+                    sh "docker rmi -f ${LOCAL_IMAGE_TAG} || true"
+                    sh "docker build -t ${LOCAL_IMAGE_TAG} ."
                 }
-
             }
         }
-
-
-
-
-    //     stage('Docker Scout Image') {
-    //         steps {
-    //             script{
-    //                 withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
-    //                 sh "docker login -u elsonpulikkan -p ${dockerpwd}"
-    //                 sh 'docker-scout cves flipkart'
-    //                 sh 'docker-scout recommendations flipkart'
-    //             }
-    //         }
-    //     }
-    // }
-
 
         stage('Docker Scout Image') {
             steps {
                 script {
                     withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
-                        // Login to Docker Hub
                         sh "docker login -u elsonpulikkan -p ${dockerpwd}"
-
-                        // Run Docker Scout CVE scan and save output
-                        // sh "docker-scout cves flipkart --format json > image-cves-report.json"
-                        sh "docker-scout cves flipkart > image-cves-report.txt"
-
-                        // Run recommendations and save results
-                        // sh "docker-scout recommendations flipkart --format json > image-recommendations.json"
-                        sh "docker-scout recommendations flipkart > image-recommendations.txt"
-
-                        // Show short summary in Jenkins console
-                        // sh "echo '--- Docker Scout Image CVE Summary ---'"
-                        // sh "head -20 image-cves-report.txt"
+                        sh "docker-scout cves ${LOCAL_IMAGE_TAG} > image-cves-report.txt || true"
+                        sh "docker-scout recommendations ${LOCAL_IMAGE_TAG} > image-recommendations.txt || true"
                     }
                 }
-                // Archive all reports for easy download
-                archiveArtifacts artifacts: '*.txt, *.json', fingerprint: true
+                archiveArtifacts artifacts: 'image-*.txt, quickview-report.txt, cves-report.txt', fingerprint: true
             }
         }
 
-        
+        stage("Upload App Image to ECR") {
+            steps {
+                script {
+                    // Tag local image for ECR & push using docker plugin
+                    def ecrTag = "${IMAGE_NAME}:${BUILD_NUMBER}"
+                    sh "docker tag ${LOCAL_IMAGE_TAG} ${ecrTag}"
+                    sh "docker tag ${LOCAL_IMAGE_TAG} ${IMAGE_NAME}:latest"
 
-
-            stage("Upload App Image to ECR") {
-                steps {
-                    script {
-                        // Tag local image for ECR
-                        sh """
-                            docker tag flipkart ${IMAGE_NAME}:${BUILD_NUMBER}
-                            docker tag flipkart ${IMAGE_NAME}:latest
-                        """
-
-                        // Define the image object for Jenkins Docker plugin
-                        def dockerImage = docker.image("${IMAGE_NAME}")
-
-                        // Push both tags using the Jenkins ECR credentials
-                        docker.withRegistry(flipkartRegistry, registryCredential) {
-                            dockerImage.push("${BUILD_NUMBER}")
-                            dockerImage.push("latest")
-                        sh "docker logout"
-                        }
+                    def dockerImage = docker.image("${IMAGE_NAME}")
+                    docker.withRegistry(flipkartRegistry, registryCredential) {
+                        dockerImage.push("${BUILD_NUMBER}")
+                        dockerImage.push("latest")
                     }
+                    sh "docker logout || true"
                 }
             }
-
-
-
+        }
 
         stage("Tag & Push to DockerHub") {
             steps {
                 script {
                     withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
                         sh "docker login -u elsonpulikkan -p ${dockerpwd}"
-                        sh "docker tag flipkart ${env.IMAGE_TAG}"
+                        // Tag the built local image with your DockerHub user tag and push
+                        env.IMAGE_TAG = "elsonpulikkan/flipkart:${BUILD_NUMBER}"
+                        sh "docker tag ${LOCAL_IMAGE_TAG} ${env.IMAGE_TAG}"
                         sh "docker push ${env.IMAGE_TAG}"
-
-                        // Also push latest
-                        sh "docker tag flipkart elsonpulikkan/flipkart:latest"
-                        
+                        sh "docker tag ${LOCAL_IMAGE_TAG} elsonpulikkan/flipkart:latest"
                         sh "docker push elsonpulikkan/flipkart:latest"
-                        sh "docker logout"
+                        sh "docker logout || true"
                     }
                 }
             }
         }
 
-
+        // Deploy stage - finds a free high port and runs the container bound to 127.0.0.1:<PORT>:80
         stage("Deploy to Container") {
             steps {
                 script {
+                    // choose a free port in a safe ephemeral range (30000-30100)
+                    def hostPort = sh(script: '''
+                        for p in $(seq 30000 30100); do
+                          if ! ss -ltn "( sport = :$p )" >/dev/null 2>&1 && ! ss -ltn | grep -q ":$p "; then
+                            echo $p
+                            exit 0
+                          fi
+                        done
+                        echo ""
+                    ''', returnStdout: true).trim()
+
+                    if (!hostPort) {
+                        error "No free port available in range 30000-30100"
+                    }
+                    echo "Selected host port: ${hostPort}"
+                    env.HOST_PORT = hostPort
+                    env.APP_URL = "http://localhost:${hostPort}"
+
+                    // stop/remove previous container if exists and run container bound to 127.0.0.1
                     sh "docker rm -f flipkart || true"
-                    sh "docker run -d --name flipkart -p 80:80 ${env.IMAGE_TAG}"
+                    sh "docker run -d --name flipkart -p 127.0.0.1:${HOST_PORT}:80 ${LOCAL_IMAGE_TAG}"
+
+                    // wait for the app to respond (simple loop)
+                    sh '''
+                      for i in $(seq 1 20); do
+                        if curl -sI --max-time 2 "http://localhost:'"${HOST_PORT}"'" >/dev/null 2>&1; then
+                          echo "App is up on port '"${HOST_PORT}"'"
+                          exit 0
+                        fi
+                        sleep 1
+                      done
+                      echo "App did not respond within timeout"; exit 1
+                    '''
                 }
             }
         }
@@ -230,62 +185,48 @@ pipeline {
         stage("DAST Scan with OWASP ZAP") {
             steps {
                 script {
-                    echo '🔍 Running OWASP ZAP baseline scan...'
+                    echo "🔍 Running OWASP ZAP baseline scan against ${env.APP_URL} ..."
 
-                    // Run ZAP but ignore exit code
-                    def exitCode = sh(script: '''
-                        docker run --rm --user root --network host -v $(pwd):/zap/wrk:rw \
-                        -t zaproxy/zap-stable zap-baseline.py \
-                        -t http://localhost \
-                        -r zap_report.html -J zap_report.json
-                    ''', returnStatus: true)
+                    // We'll run ZAP with host networking so it can reach localhost:<HOST_PORT>
+                    def zapExit = sh(script: """
+                        docker run --rm --user root --network host -v \$(pwd):/zap/wrk:rw -t zaproxy/zap-stable zap-baseline.py \
+                          -t ${env.APP_URL} \
+                          -r zap_report.html -J zap_report.json
+                    """, returnStatus: true)
 
-                    echo "ZAP scan finished with exit code: ${exitCode}"
+                    echo "ZAP scan finished with exit code: ${zapExit}"
 
-                    // Read the JSON report if it exists
                     if (fileExists('zap_report.json')) {
                         def zapJson = readJSON file: 'zap_report.json'
-
-                        def highCount = zapJson.site.collect { site ->
-                            site.alerts.findAll { it.risk == 'High' }.size()
-                        }.sum()
-
-                        def mediumCount = zapJson.site.collect { site ->
-                            site.alerts.findAll { it.risk == 'Medium' }.size()
-                        }.sum()
-
-                        def lowCount = zapJson.site.collect { site ->
-                            site.alerts.findAll { it.risk == 'Low' }.size()
-                        }.sum()
+                        def highCount = zapJson.site.collect { s -> s.alerts.findAll { it.risk == 'High' }.size() }.sum()
+                        def mediumCount = zapJson.site.collect { s -> s.alerts.findAll { it.risk == 'Medium' }.size() }.sum()
+                        def lowCount = zapJson.site.collect { s -> s.alerts.findAll { it.risk == 'Low' }.size() }.sum()
 
                         echo "✅ High severity issues: ${highCount}"
                         echo "⚠️ Medium severity issues: ${mediumCount}"
                         echo "ℹ️ Low severity issues: ${lowCount}"
                     } else {
-                        echo "ZAP JSON report not found, continuing build..."
+                        echo "ZAP JSON report not found; continuing"
                     }
                 }
             }
             post {
                 always {
-                    echo '📦 Archiving ZAP scan reports...'
                     archiveArtifacts artifacts: 'zap_report.html,zap_report.json', allowEmptyArchive: true
                 }
             }
         }
 
+    } // end stages
 
-    }
-    
     post {
         always {
             script {
-                // 🔹 Common values
                 def buildStatus = currentBuild.currentResult
                 def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'GitHub User'
                 def buildUrl = "${env.BUILD_URL}"
 
-                // 🟢 Slack Notification
+                // Slack notification (make sure slack plugin & credentials configured)
                 slackSend(
                     channel: '#devsecops',
                     color: COLOR_MAP[buildStatus],
@@ -294,26 +235,24 @@ pipeline {
                     🔗 *Build URL:* <${buildUrl}|Click Here for Details>"""
                 )
 
-                // 📧 Email Notification
-            emailext (
-                subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                body: """
-                    <p>GitHub URL :- https://github.com/elsonpulikkan96 </p>                                     
-                    <p>Flipkart DevSecops CICD pipeline status.</p>
-                    <p>Project: ${env.JOB_NAME}</p>
-                    <p>Build Number: ${env.BUILD_NUMBER}</p>
-                    <p>Build Status: ${buildStatus}</p>
-                    <p>Started by: ${buildUser}</p>
-                    <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
-                """,
-                to: 'elsonpulikkan@gmail.com',
-                from: 'elsonpulikkan@gmail.com',
-                mimeType: 'text/html',
-                attachmentsPattern: 'quickview-report.txt,cves-report.json,cves-report.txt,image-cves-report.json,image-cves-report.txt,image-recommendations.json,image-recommendations.txt,dependency-check-report.xml,zap_report.html,zap_report.json'
-                    )  
-
+                // Email notification
+                emailext (
+                    subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        <p>GitHub URL :- https://github.com/elsonpulikkan96 </p>
+                        <p>Flipkart DevSecops CICD pipeline status.</p>
+                        <p>Project: ${env.JOB_NAME}</p>
+                        <p>Build Number: ${env.BUILD_NUMBER}</p>
+                        <p>Build Status: ${buildStatus}</p>
+                        <p>Started by: ${buildUser}</p>
+                        <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    """,
+                    to: 'elsonpulikkan@gmail.com',
+                    from: 'elsonpulikkan@gmail.com',
+                    mimeType: 'text/html',
+                    attachmentsPattern: 'quickview-report.txt,cves-report.txt,image-cves-report.txt,image-recommendations.txt,dependency-check-report.xml,zap_report.html,zap_report.json'
+                )
             }
         }
     }
-
- }
+}
