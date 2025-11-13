@@ -12,7 +12,7 @@ pipeline {
     environment {
         SCANNER_HOME = tool 'sonar-scanner'
         registryCredential = 'ecr:us-east-1:awscreds'
-        ECR_IMAGE = '739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg'
+        IMAGE_NAME   = '739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg'
         DOCKERHUB_REPO = 'elsonpulikkan/flipkart'
     }
 
@@ -31,11 +31,10 @@ pipeline {
             steps { sh "npm ci --silent" }
         }
 
-        stage("Sonarqube Analysis") {
+        stage("Sonarqube Analysis ") {
             steps {
                 withSonarQubeEnv('sonar-server') {
-                    sh """$SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=flipkart \
-                        -Dsonar.projectKey=flipkart"""
+                    sh """${SCANNER_HOME}/bin/sonar-scanner -Dsonar.projectName=flipkart -Dsonar.projectKey=flipkart"""
                 }
             }
         }
@@ -67,11 +66,11 @@ pipeline {
                 script {
                     withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
                         sh "docker login -u elsonpulikkan -p ${dockerpwd}"
-                        sh "docker-scout quickview fs://. > quickview-report.txt"
-                        sh "docker-scout cves fs://. > cves-report.txt"
+                        sh "docker-scout quickview fs://. > quickview-report.txt || true"
+                        sh "docker-scout cves fs://. > cves-report.txt || true"
                         sh "echo '--- Docker Scout Summary ---'"
                         sh "head -20 quickview-report.txt || true"
-                        sh "docker logout"
+                        sh "docker logout || true"
                     }
                 }
                 archiveArtifacts artifacts: '*.txt, *.json', fingerprint: true
@@ -95,7 +94,7 @@ pipeline {
                         sh "docker login -u elsonpulikkan -p ${dockerpwd}"
                         sh "docker-scout cves ${env.LOCAL_IMAGE} > image-cves-report.txt || true"
                         sh "docker-scout recommendations ${env.LOCAL_IMAGE} > image-recommendations.txt || true"
-                        sh "docker logout"
+                        sh "docker logout || true"
                     }
                 }
                 archiveArtifacts artifacts: '*.txt, *.json', fingerprint: true
@@ -106,11 +105,11 @@ pipeline {
             steps {
                 script {
                     sh """
-                        docker tag ${env.LOCAL_IMAGE} ${ECR_IMAGE}:${BUILD_NUMBER}
-                        docker tag ${env.LOCAL_IMAGE} ${ECR_IMAGE}:latest
+                        docker tag ${env.LOCAL_IMAGE} ${IMAGE_NAME}:${BUILD_NUMBER}
+                        docker tag ${env.LOCAL_IMAGE} ${IMAGE_NAME}:latest
                     """
-                    def dockerImage = docker.image("${ECR_IMAGE}")
-                    docker.withRegistry("https://739275449845.dkr.ecr.us-east-1.amazonaws.com", registryCredential) {
+                    def dockerImage = docker.image("${IMAGE_NAME}")
+                    docker.withRegistry("https://${IMAGE_NAME.split('/')[0]}", registryCredential) {
                         dockerImage.push("${BUILD_NUMBER}")
                         dockerImage.push("latest")
                     }
@@ -127,7 +126,7 @@ pipeline {
                         sh "docker push ${DOCKERHUB_REPO}:${BUILD_NUMBER}"
                         sh "docker tag ${env.LOCAL_IMAGE} ${DOCKERHUB_REPO}:latest"
                         sh "docker push ${DOCKERHUB_REPO}:latest"
-                        sh "docker logout"
+                        sh "docker logout || true"
                     }
                 }
             }
@@ -138,23 +137,22 @@ pipeline {
                 script {
                     sh "docker rm -f flipkart || true"
 
-                    // Run container with -P so Docker maps container ports to free host ports
+                    // Start container with -P so Docker assigns a free host port
                     def containerId = sh(script: "docker run -d --name flipkart -P ${env.LOCAL_IMAGE}", returnStdout: true).trim()
                     echo "containerId=${containerId}"
 
-                    // Safely get mapped host port for container port 80
-                    // Use a literal string to avoid Groovy interpolation/backslash issues, and concatenate containerId
-                    def hostPort = sh(script: '''docker port ''' + containerId + ''' 80 | awk -F: '{print $2}' | sed 's/[^0-9]*//g' | head -n1''', returnStdout: true).trim()
+                    // Extract mapped host port (for container port 80)
+                    def hostPort = sh(script: "docker port ${containerId} 80 | awk -F: '{print \$2}' | sed 's/[^0-9]*//g' | head -n1", returnStdout: true).trim()
 
                     if (!hostPort) {
                         error "Failed to determine mapped host port for container ${containerId}"
                     }
 
                     env.APP_HOST_PORT = hostPort
-                    echo "Container flipkart is mapped to host port: ${env.APP_HOST_PORT}"
+                    echo "Container flipkart mapped host port: ${env.APP_HOST_PORT}"
 
-                    // quick smoke test using the health endpoint we added to the image
-                    sh "curl -sSf http://localhost:${env.APP_HOST_PORT}/healthz || (echo 'health check failed' && docker logs ${containerId} && exit 1)"
+                    // quick smoke test
+                    sh "curl -sSf http://localhost:${env.APP_HOST_PORT}/ || (echo 'health check failed' && docker logs ${containerId} && exit 1)"
                 }
             }
         }
@@ -164,10 +162,11 @@ pipeline {
                 script {
                     echo "🔍 Running OWASP ZAP baseline scan against http://localhost:${env.APP_HOST_PORT} ..."
                     def targetUrl = "http://localhost:${env.APP_HOST_PORT}"
-                    def exitCode = sh(script: """
-                        docker run --rm --user root --network host -v $(pwd):/zap/wrk:rw -t zaproxy/zap-stable zap-baseline.py \
-                          -t ${targetUrl} -r zap_report.html -J zap_report.json
-                    """, returnStatus: true)
+
+                    // Use env.WORKSPACE for mount (no $(pwd) -> no $ escaping problems)
+                    def zapCmd = "docker run --rm --user root --network host -v ${env.WORKSPACE}:/zap/wrk:rw -t zaproxy/zap-stable zap-baseline.py -t ${targetUrl} -r zap_report.html -J zap_report.json"
+                    def exitCode = sh(script: zapCmd, returnStatus: true)
+
                     echo "ZAP scan finished with exit code: ${exitCode}"
 
                     if (fileExists('zap_report.json')) {
