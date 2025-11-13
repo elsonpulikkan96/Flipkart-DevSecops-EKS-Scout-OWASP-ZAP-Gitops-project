@@ -81,7 +81,6 @@ pipeline {
         stage("Build Docker Image") {
             steps {
                 script {
-                    // Build and tag a local image with build number
                     env.LOCAL_IMAGE = "flipkart:${BUILD_NUMBER}"
                     sh "docker rmi -f ${env.LOCAL_IMAGE} || true"
                     sh "docker build -t ${env.LOCAL_IMAGE} ."
@@ -106,7 +105,6 @@ pipeline {
         stage("Upload App Image to ECR") {
             steps {
                 script {
-                    // Tag local image for ECR and push
                     sh """
                         docker tag ${env.LOCAL_IMAGE} ${ECR_IMAGE}:${BUILD_NUMBER}
                         docker tag ${env.LOCAL_IMAGE} ${ECR_IMAGE}:latest
@@ -138,25 +136,24 @@ pipeline {
         stage("Deploy to Container (ephemeral host port)") {
             steps {
                 script {
-                    // Remove any existing container and run with -P (publish exposed ports to random host ports)
                     sh "docker rm -f flipkart || true"
 
-                    // Run container and get container id
+                    // Run container with -P so Docker maps container ports to free host ports
                     def containerId = sh(script: "docker run -d --name flipkart -P ${env.LOCAL_IMAGE}", returnStdout: true).trim()
                     echo "containerId=${containerId}"
 
-                    // Get host port mapped to container port 80
-                    def hostPort = sh(script: "docker port ${containerId} 80 | sed -E 's/.*:(\\\d+)\$/\\1/' | head -n1", returnStdout: true).trim()
+                    // Safely get mapped host port for container port 80
+                    // Use a literal string to avoid Groovy interpolation/backslash issues, and concatenate containerId
+                    def hostPort = sh(script: '''docker port ''' + containerId + ''' 80 | awk -F: '{print $2}' | sed 's/[^0-9]*//g' | head -n1''', returnStdout: true).trim()
 
                     if (!hostPort) {
                         error "Failed to determine mapped host port for container ${containerId}"
                     }
 
-                    // expose host port to later stages
                     env.APP_HOST_PORT = hostPort
                     echo "Container flipkart is mapped to host port: ${env.APP_HOST_PORT}"
 
-                    // quick smoke test
+                    // quick smoke test using the health endpoint we added to the image
                     sh "curl -sSf http://localhost:${env.APP_HOST_PORT}/healthz || (echo 'health check failed' && docker logs ${containerId} && exit 1)"
                 }
             }
@@ -167,7 +164,6 @@ pipeline {
                 script {
                     echo "🔍 Running OWASP ZAP baseline scan against http://localhost:${env.APP_HOST_PORT} ..."
                     def targetUrl = "http://localhost:${env.APP_HOST_PORT}"
-                    // Run ZAP baseline scan container (runs as ephemeral container). Don't abort pipeline on non-zero so we archive logs.
                     def exitCode = sh(script: """
                         docker run --rm --user root --network host -v $(pwd):/zap/wrk:rw -t zaproxy/zap-stable zap-baseline.py \
                           -t ${targetUrl} -r zap_report.html -J zap_report.json
@@ -176,7 +172,6 @@ pipeline {
 
                     if (fileExists('zap_report.json')) {
                         def zapJson = readJSON file: 'zap_report.json'
-                        // best-effort counts (guarded)
                         def highCount = 0; def mediumCount = 0; def lowCount = 0
                         if (zapJson?.site) {
                             highCount = zapJson.site.collect { s -> s.alerts.findAll { it.risk == 'High' }.size() }.sum()
