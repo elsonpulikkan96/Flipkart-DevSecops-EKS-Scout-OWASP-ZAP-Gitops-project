@@ -7,7 +7,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/elsonpulikkan96/Flipkart-DevSecops-EKS-Scout-OWASP-ZAP-Gitops-project
-    targetRevision: staging
+    targetRevision: main
     path: environments/staging
   destination:
     server: https://kubernetes.default.svc
