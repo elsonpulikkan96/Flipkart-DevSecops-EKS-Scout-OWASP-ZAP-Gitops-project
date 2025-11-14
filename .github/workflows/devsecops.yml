@@ -1,0 +1,209 @@
+name: DevSecOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  ECR_REGISTRY: 739275449845.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: flipkartimg
+  EKS_CLUSTER: flipkart-eks-cluster
+  AWS_REGION: us-east-1
+  ACM_CERT_ARN: arn:aws:acm:us-east-1:739275449845:certificate/f5be8959-2f51-44b4-a827-6ca97cc45a98
+
+jobs:
+  security-scan:
+    runs-on: self-hosted
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Trivy filesystem scan
+      run: |
+        docker run --rm -v $PWD:/workspace aquasec/trivy:latest fs /workspace --format json --output trivy-report.json
+    
+    - name: Upload Trivy results
+      uses: actions/upload-artifact@v4
+      with:
+        name: trivy-results
+        path: trivy-report.json
+
+  build-and-push:
+    runs-on: self-hosted
+    needs: security-scan
+    outputs:
+      image-tag: ${{ steps.build.outputs.tag }}
+      image-uri: ${{ steps.build.outputs.image }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      run: |
+        aws configure set region $AWS_REGION
+    
+    - name: Login to Amazon ECR
+      run: |
+        aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+    
+    - name: Build and tag Docker image
+      id: build
+      run: |
+        TAG=${{ github.sha }}
+        IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG
+        docker build -t $IMAGE_URI .
+        docker tag $IMAGE_URI $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+    
+    - name: Push image to ECR
+      run: |
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.build.outputs.tag }}
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+  docker-scout-scan:
+    runs-on: self-hosted
+    needs: build-and-push
+    steps:
+    - name: Docker Scout vulnerability scan
+      run: |
+        docker scout cves ${{ needs.build-and-push.outputs.image-uri }} --format json --output scout-report.json || true
+    
+    - name: Upload Scout results
+      uses: actions/upload-artifact@v4
+      with:
+        name: scout-results
+        path: scout-report.json
+
+  zap-scan:
+    runs-on: self-hosted
+    needs: build-and-push
+    steps:
+    - name: Start test application
+      run: |
+        docker run -d --name test-app -p 3000:80 ${{ needs.build-and-push.outputs.image-uri }}
+        sleep 15
+        curl -f http://localhost:3000 || echo "App not ready, continuing with scan"
+    
+    - name: OWASP ZAP baseline scan
+      run: |
+        docker run --rm --network host -v $PWD:/zap/wrk \
+          owasp/zap2docker-stable zap-baseline.py \
+          -t http://127.0.0.1:3000 -J zap-report.json || true
+      continue-on-error: true
+    
+    - name: Upload ZAP results
+      uses: actions/upload-artifact@v4
+      with:
+        name: zap-results
+        path: zap-report.json
+    
+    - name: Cleanup test container
+      if: always()
+      run: |
+        docker stop test-app || true
+        docker rm test-app || true
+
+  deploy:
+    runs-on: self-hosted
+    needs: [build-and-push, docker-scout-scan, zap-scan]
+    if: github.ref == "refs/heads/main"
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure kubectl for EKS
+      run: |
+        sudo aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+    
+    - name: Create deployment manifest
+      run: |
+        sudo tee /tmp/deployment.yaml << "YAML_EOF"
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: flipkart-ns
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          namespace: flipkart-ns
+          name: flipkart-app-deployment
+        spec:
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: flipkart-app
+          replicas: 3
+          template:
+            metadata:
+              labels:
+                app.kubernetes.io/name: flipkart-app
+            spec:
+              containers:
+                - name: flipkart-app-container
+                  image: ${{ needs.build-and-push.outputs.image-uri }}
+                  ports:
+                    - containerPort: 80
+                  resources:
+                    requests:
+                      memory: "128Mi"
+                      cpu: "250m"
+                    limits:
+                      memory: "256Mi"
+                      cpu: "500m"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          namespace: flipkart-ns
+          name: flipkart-app-service
+        spec:
+          ports:
+            - port: 80
+              targetPort: 80
+              protocol: TCP
+          type: ClusterIP
+          selector:
+            app.kubernetes.io/name: flipkart-app
+        ---
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          namespace: flipkart-ns
+          name: flipkart-ingress
+          annotations:
+            alb.ingress.kubernetes.io/scheme: internet-facing
+            alb.ingress.kubernetes.io/target-type: ip
+            alb.ingress.kubernetes.io/listen-ports: "[{\"HTTP\": 80}, {\"HTTPS\": 443}]"
+            alb.ingress.kubernetes.io/certificate-arn: $ACM_CERT_ARN
+            alb.ingress.kubernetes.io/ssl-redirect: "443"
+        spec:
+          ingressClassName: alb
+          rules:
+            - host: flipstore.elsondevops.cloud
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: flipkart-app-service
+                      port:
+                        number: 80
+        YAML_EOF
+    
+    - name: Deploy to EKS
+      run: |
+        sudo kubectl apply -f /tmp/deployment.yaml
+        sudo kubectl rollout status deployment/flipkart-app-deployment -n flipkart-ns --timeout=300s
+    
+    - name: Get deployment info
+      run: |
+        echo "=== Deployment Status ==="
+        sudo kubectl get pods -n flipkart-ns
+        sudo kubectl get svc -n flipkart-ns
+        sudo kubectl get ingress -n flipkart-ns
+        echo "Application URL: https://flipstore.elsondevops.cloud"

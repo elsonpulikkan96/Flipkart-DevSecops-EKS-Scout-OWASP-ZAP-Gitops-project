@@ -1,22 +1,88 @@
-dist
-.git
-.gitignore
-Dockerfile
-README.md
-*.log
-*.md
-.env
-/Jenkinsfile
-/k8s-80
-/k8s-hostbased-https
+# ===========================
+# Essential exclusions
+# ===========================
 
-cves-report.json
+# Never send node_modules to Docker build context
+node_modules/
+**/node_modules/
+
+# Ignore build output from React
+build/
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Temporary OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local environment files
+.env
+.env.* 
+!.env.example
+
+# Git data
+.git/
+.gitignore
+.gitattributes
+
+# Editor folders
+.vscode/
+.idea/
+
+# Docker artifacts
+docker-compose.yml
+docker-compose*.yml
+Dockerfile
+
+# Ignore Jenkins workspace metadata
+.jenkins/
+workspace/
+
+# Sonar & Dependency Check outputs
+.scannerwork/
+dependency-check-report.*
+zap_report.*
 quickview-report.txt
 cves-report.txt
-report.html
-report.json
-
-image-cves-report.json
 image-cves-report.txt
-image-recommendations.json
 image-recommendations.txt
+
+# NPM cache folders
+.npm/
+.npmcache/
+.cache/
+.tmp/
+
+# Python virtual env (if any backend tools exist)
+venv/
+.venv/
+
+# Testing outputs
+coverage/
+jest-coverage/
+*.test.js
+*.spec.js
+
+# Build artifacts (rare)
+*.tar.gz
+*.zip
+
+# ===========================
+# Ignore your microservices under node_modules (Fixes infinite loop)
+# ===========================
+node_modules/flipkart/
+node_modules/flipkart/**
+
+# ===========================
+# Ignore unnecessary resources
+# ===========================
+*.md
+*.pdf
+*.pptx
