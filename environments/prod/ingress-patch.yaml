@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: flipkart-ingress
+  namespace: flipkart-prod
+spec:
+  rules:
+  - host: flipstore.elsondevops.cloud
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: prod-flipkart-app-service
+            port:
+              number: 80

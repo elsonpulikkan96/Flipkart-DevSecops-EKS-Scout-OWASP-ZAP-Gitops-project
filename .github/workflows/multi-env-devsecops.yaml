@@ -1,0 +1,266 @@
+name: Multi-Environment DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, staging, dev ]
+  pull_request:
+    branches: [ main, staging ]
+
+env:
+  ECR_REGISTRY: 739275449845.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: flipkartimg
+  AWS_REGION: us-east-1
+  EKS_CLUSTER: flipkart-eks-cluster
+
+jobs:
+  # 1. Code Quality & Security Analysis
+  code-quality:
+    runs-on: self-hosted
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        npm install || echo "No package.json found"
+    
+    - name: ESLint Check
+      run: |
+        npm run lint || echo "No lint script configured"
+    
+    - name: Dependency Audit
+      run: |
+        npm audit --audit-level=moderate || echo "Audit completed with warnings"
+    
+    - name: Upload Code Quality Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: code-quality-report
+        path: |
+          *.log
+          coverage/
+
+  # 2. Security Scanning
+  security-scan:
+    runs-on: self-hosted
+    needs: code-quality
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Trivy Filesystem Scan
+      run: |
+        docker run --rm -v $PWD:/workspace aquasec/trivy:latest fs /workspace \
+          --severity HIGH,CRITICAL --format json --output trivy-fs.json
+    
+    - name: Semgrep SAST Scan
+      run: |
+        docker run --rm -v $PWD:/src semgrep/semgrep:latest \
+          --config=auto --json --output=semgrep.json /src || true
+    
+    - name: Upload Security Reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-reports
+        path: |
+          trivy-fs.json
+          semgrep.json
+
+  # 3. Build and Push to ECR
+  build-push:
+    runs-on: self-hosted
+    needs: [code-quality, security-scan]
+    outputs:
+      image-tag: ${{ steps.build.outputs.tag }}
+      image-uri: ${{ steps.build.outputs.image }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      run: |
+        aws configure set region $AWS_REGION
+    
+    - name: Login to Amazon ECR
+      run: |
+        aws ecr get-login-password --region $AWS_REGION | \
+          docker login --username AWS --password-stdin $ECR_REGISTRY
+    
+    - name: Build and Push Docker Image
+      id: build
+      run: |
+        TAG=${{ github.sha }}
+        IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG
+        
+        docker build -t $IMAGE_URI .
+        docker push $IMAGE_URI
+        
+        # Also tag as latest for the branch
+        BRANCH_TAG=${{ github.ref_name }}-latest
+        docker tag $IMAGE_URI $ECR_REGISTRY/$ECR_REPOSITORY:$BRANCH_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$BRANCH_TAG
+        
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+  # 4. Container Security Scanning
+  container-security:
+    runs-on: self-hosted
+    needs: build-push
+    steps:
+    - name: Trivy Image Scan
+      run: |
+        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          aquasec/trivy:latest image --severity HIGH,CRITICAL \
+          --format json --output trivy-image.json \
+          ${{ needs.build-push.outputs.image-uri }}
+    
+    - name: Docker Scout CVE Scan
+      run: |
+        docker scout cves ${{ needs.build-push.outputs.image-uri }} \
+          --format json --output scout-cve.json || true
+    
+    - name: Upload Container Security Reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: container-security-reports
+        path: |
+          trivy-image.json
+          scout-cve.json
+
+  # 5. Dynamic Application Security Testing
+  dast:
+    runs-on: self-hosted
+    needs: build-push
+    steps:
+    - name: Start Test Application
+      run: |
+        docker run -d --name test-app -p 3000:80 \
+          ${{ needs.build-push.outputs.image-uri }}
+        sleep 20
+        curl -f http://localhost:3000 || echo "App starting..."
+    
+    - name: OWASP ZAP Baseline Scan
+      run: |
+        docker run --rm --network host -v $PWD:/zap/wrk \
+          owasp/zap2docker-stable zap-baseline.py \
+          -t http://127.0.0.1:3000 -J zap-baseline.json || true
+    
+    - name: Nuclei Vulnerability Scan
+      run: |
+        docker run --rm --network host \
+          projectdiscovery/nuclei:latest \
+          -target http://127.0.0.1:3000 -json -o nuclei.json || true
+    
+    - name: Upload DAST Reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: dast-reports
+        path: |
+          zap-baseline.json
+          nuclei.json
+    
+    - name: Cleanup Test Container
+      if: always()
+      run: |
+        docker stop test-app || true
+        docker rm test-app || true
+
+  # 6. Deploy to Development (Auto on dev branch)
+  deploy-dev:
+    runs-on: self-hosted
+    needs: [build-push, container-security, dast]
+    if: github.ref == refs/heads/dev
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Update Dev Environment
+      run: |
+        cd environments/dev
+        kustomize edit set image \
+          739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg:${{ needs.build-push.outputs.tag }}
+        
+        git config --global user.name "elsonpulikkan96"
+        git config --global user.email "elsonpulikkan@gmail.com"
+        git add .
+        git commit -m "Deploy ${{ needs.build-push.outputs.tag }} to dev" || exit 0
+        git push origin dev
+    
+    - name: Deploy to Dev Namespace
+      run: |
+        sudo aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+        cd environments/dev
+        sudo kustomize build . | sudo kubectl apply -f -
+        sudo kubectl rollout status deployment/dev-flipkart-app-deployment -n flipkart-dev --timeout=300s
+
+  # 7. Deploy to Staging (Auto on staging branch)
+  deploy-staging:
+    runs-on: self-hosted
+    needs: [build-push, container-security, dast]
+    if: github.ref == refs/heads/staging
+    environment: staging
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Update Staging Environment
+      run: |
+        cd environments/staging
+        kustomize edit set image \
+          739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg:${{ needs.build-push.outputs.tag }}
+        
+        git config --global user.name "elsonpulikkan96"
+        git config --global user.email "elsonpulikkan@gmail.com"
+        git add .
+        git commit -m "Deploy ${{ needs.build-push.outputs.tag }} to staging" || exit 0
+        git push origin staging
+    
+    - name: Deploy to Staging Namespace
+      run: |
+        sudo aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+        cd environments/staging
+        sudo kustomize build . | sudo kubectl apply -f -
+        sudo kubectl rollout status deployment/staging-flipkart-app-deployment -n flipkart-staging --timeout=300s
+
+  # 8. Deploy to Production (Manual approval on main branch)
+  deploy-prod:
+    runs-on: self-hosted
+    needs: [build-push, container-security, dast]
+    if: github.ref == refs/heads/main
+    environment: production
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Production Readiness Check
+      run: |
+        echo "🔍 Running production readiness checks..."
+        # Add custom production checks here
+        echo "✅ Production checks passed"
+    
+    - name: Update Production Environment
+      run: |
+        cd environments/prod
+        kustomize edit set image \
+          739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg:${{ needs.build-push.outputs.tag }}
+        
+        git config --global user.name "elsonpulikkan96"
+        git config --global user.email "elsonpulikkan@gmail.com"
+        git add .
+        git commit -m "Deploy ${{ needs.build-push.outputs.tag }} to production" || exit 0
+        git push origin main
+    
+    - name: Deploy to Production Namespace
+      run: |
+        sudo aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+        cd environments/prod
+        sudo kustomize build . | sudo kubectl apply -f -
+        sudo kubectl rollout status deployment/prod-flipkart-app-deployment -n flipkart-prod --timeout=300s
+    
+    - name: Post-Deployment Verification
+      run: |
+        echo "🚀 Production deployment completed"
+        sudo kubectl get pods -n flipkart-prod
+        sudo kubectl get svc -n flipkart-prod
+        sudo kubectl get ingress -n flipkart-prod

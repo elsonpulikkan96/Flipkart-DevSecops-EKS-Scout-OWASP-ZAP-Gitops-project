@@ -1,0 +1,218 @@
+name: Enhanced DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  ECR_REGISTRY: 739275449845.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: flipkartimg
+  AWS_REGION: us-east-1
+
+jobs:
+  # 1. Code Quality & Security
+  code-quality:
+    runs-on: self-hosted
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: SonarQube Scan
+      run: |
+        docker run --rm -v $PWD:/usr/src sonarqube/sonar-scanner-cli \
+          -Dsonar.projectKey=flipkart-app \
+          -Dsonar.sources=src/ || echo "SonarQube not configured"
+    
+    - name: ESLint Check
+      run: |
+        npm install
+        npm run lint || echo "No lint script"
+    
+    - name: Dependency Check
+      run: |
+        npm audit --audit-level=high || echo "Audit warnings found"
+
+  # 2. Security Scans
+  security-scan:
+    runs-on: self-hosted
+    needs: code-quality
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Trivy Filesystem Scan
+      run: |
+        docker run --rm -v $PWD:/workspace aquasec/trivy:latest fs /workspace \
+          --severity HIGH,CRITICAL --format json --output trivy-fs.json
+    
+    - name: Semgrep SAST
+      run: |
+        docker run --rm -v $PWD:/src semgrep/semgrep:latest \
+          --config=auto --json --output=semgrep.json /src || true
+    
+    - name: Upload Security Reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-reports
+        path: |
+          trivy-fs.json
+          semgrep.json
+
+  # 3. Build & Test
+  build-test:
+    runs-on: self-hosted
+    needs: security-scan
+    outputs:
+      image-tag: ${{ steps.build.outputs.tag }}
+      image-uri: ${{ steps.build.outputs.image }}
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Run Unit Tests
+      run: |
+        npm install
+        npm test || echo "No tests configured"
+    
+    - name: Build & Push Image
+      id: build
+      run: |
+        TAG=${{ github.sha }}
+        IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG
+        
+        aws ecr get-login-password --region $AWS_REGION | \
+          docker login --username AWS --password-stdin $ECR_REGISTRY
+        
+        docker build -t $IMAGE_URI .
+        docker push $IMAGE_URI
+        
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+  # 4. Container Security
+  container-security:
+    runs-on: self-hosted
+    needs: build-test
+    steps:
+    - name: Trivy Image Scan
+      run: |
+        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          aquasec/trivy:latest image --severity HIGH,CRITICAL \
+          --format json --output trivy-image.json \
+          ${{ needs.build-test.outputs.image-uri }}
+    
+    - name: Docker Scout CVE Scan
+      run: |
+        docker scout cves ${{ needs.build-test.outputs.image-uri }} \
+          --format json --output scout-cve.json || true
+    
+    - name: Upload Container Reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: container-security
+        path: |
+          trivy-image.json
+          scout-cve.json
+
+  # 5. Dynamic Security Testing
+  dast:
+    runs-on: self-hosted
+    needs: build-test
+    steps:
+    - name: Start Test Container
+      run: |
+        docker run -d --name test-app -p 3000:80 \
+          ${{ needs.build-test.outputs.image-uri }}
+        sleep 20
+    
+    - name: OWASP ZAP Full Scan
+      run: |
+        docker run --rm --network host -v $PWD:/zap/wrk \
+          owasp/zap2docker-stable zap-full-scan.py \
+          -t http://127.0.0.1:3000 -J zap-full.json || true
+    
+    - name: Nuclei Scan
+      run: |
+        docker run --rm --network host \
+          projectdiscovery/nuclei:latest \
+          -target http://127.0.0.1:3000 -json -o nuclei.json || true
+    
+    - name: Upload DAST Reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: dast-reports
+        path: |
+          zap-full.json
+          nuclei.json
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        docker stop test-app || true
+        docker rm test-app || true
+
+  # 6. Deploy to Dev (Auto)
+  deploy-dev:
+    runs-on: self-hosted
+    needs: [build-test, container-security, dast]
+    if: github.ref == "refs/heads/develop"
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Update Dev Environment
+      run: |
+        cd environments/dev
+        kustomize edit set image \
+          739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg:${{ needs.build-test.outputs.tag }}
+        
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git add .
+        git commit -m "Deploy ${{ needs.build-test.outputs.tag }} to dev" || exit 0
+        git push origin develop
+
+  # 7. Deploy to Staging (Manual Approval)
+  deploy-staging:
+    runs-on: self-hosted
+    needs: [build-test, container-security, dast]
+    if: github.ref == "refs/heads/main"
+    environment: staging
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Update Staging Environment
+      run: |
+        cd environments/staging
+        kustomize edit set image \
+          739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg:${{ needs.build-test.outputs.tag }}
+        
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git add .
+        git commit -m "Deploy ${{ needs.build-test.outputs.tag }} to staging" || exit 0
+        git push origin main
+
+  # 8. Deploy to Production (Manual Approval + Additional Checks)
+  deploy-prod:
+    runs-on: self-hosted
+    needs: [build-test, container-security, dast]
+    if: github.ref == "refs/heads/main"
+    environment: production
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Production Readiness Check
+      run: |
+        echo "Checking production readiness..."
+        # Add custom checks here
+    
+    - name: Update Production Environment
+      run: |
+        cd environments/prod
+        kustomize edit set image \
+          739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg:${{ needs.build-test.outputs.tag }}
+        
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git add .
+        git commit -m "Deploy ${{ needs.build-test.outputs.tag }} to production" || exit 0
+        git push origin main

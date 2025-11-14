@@ -1,0 +1,118 @@
+name: GitOps DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  ECR_REGISTRY: 739275449845.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: flipkartimg
+  AWS_REGION: us-east-1
+
+jobs:
+  security-scan:
+    runs-on: self-hosted
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Trivy filesystem scan
+      run: |
+        docker run --rm -v $PWD:/workspace aquasec/trivy:latest fs /workspace --format json --output trivy-report.json
+    
+    - name: Upload Trivy results
+      uses: actions/upload-artifact@v4
+      with:
+        name: trivy-results
+        path: trivy-report.json
+
+  build-and-push:
+    runs-on: self-hosted
+    needs: security-scan
+    outputs:
+      image-tag: ${{ steps.build.outputs.tag }}
+      image-uri: ${{ steps.build.outputs.image }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      run: aws configure set region $AWS_REGION
+    
+    - name: Login to Amazon ECR
+      run: |
+        aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+    
+    - name: Build and push Docker image
+      id: build
+      run: |
+        TAG=${{ github.sha }}
+        IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$TAG
+        docker build -t $IMAGE_URI .
+        docker push $IMAGE_URI
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+  docker-scout-scan:
+    runs-on: self-hosted
+    needs: build-and-push
+    steps:
+    - name: Docker Scout scan
+      run: |
+        docker scout cves ${{ needs.build-and-push.outputs.image-uri }} --format json --output scout-report.json || true
+    
+    - name: Upload Scout results
+      uses: actions/upload-artifact@v4
+      with:
+        name: scout-results
+        path: scout-report.json
+
+  zap-scan:
+    runs-on: self-hosted
+    needs: build-and-push
+    steps:
+    - name: Start test app
+      run: |
+        docker run -d --name test-app -p 3000:80 ${{ needs.build-and-push.outputs.image-uri }}
+        sleep 15
+    
+    - name: OWASP ZAP scan
+      run: |
+        docker run --rm --network host -v $PWD:/zap/wrk \
+          owasp/zap2docker-stable zap-baseline.py \
+          -t http://127.0.0.1:3000 -J zap-report.json || true
+      continue-on-error: true
+    
+    - name: Upload ZAP results
+      uses: actions/upload-artifact@v4
+      with:
+        name: zap-results
+        path: zap-report.json
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        docker stop test-app || true
+        docker rm test-app || true
+
+  update-gitops:
+    runs-on: self-hosted
+    needs: [build-and-push, docker-scout-scan, zap-scan]
+    if: github.ref == "refs/heads/main"
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Update Kubernetes manifests
+      run: |
+        # Update image tag in deployment
+        sudo sed -i "s|739275449845.dkr.ecr.us-east-1.amazonaws.com/flipkartimg:.*|${{ needs.build-and-push.outputs.image-uri }}|g" k8s-80/deployment.yml
+        
+        # Commit and push changes (ArgoCD will auto-sync)
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git add k8s-80/deployment.yml
+        git commit -m "Update image to ${{ needs.build-and-push.outputs.image-tag }}" || exit 0
+        git push origin main || echo "No changes to push"
